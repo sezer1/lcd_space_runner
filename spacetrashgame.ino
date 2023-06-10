@@ -1,0 +1,1205 @@
+
+#include <Arduino.h>
+#include <U8g2lib.h>
+#include "PCF8574.h"
+
+#ifdef U8X8_HAVE_HW_SPI
+#include <SPI.h>
+#endif
+#ifdef U8X8_HAVE_HW_I2C
+#include <Wire.h>
+#endif
+
+U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+
+PCF8574 pcf8574_1(0x20);
+
+const uint8_t addr1 = 0x24;
+const uint8_t addr2 = 0x22;
+const uint8_t addr3 = 0x25;
+
+uint8_t pin_up = 3;
+uint8_t pin_down = 4;
+uint8_t pin_fire = 5;
+uint8_t pin_start =6;
+uint8_t pin_sec=2;
+uint8_t pot_pin=A0;
+uint8_t potVal=10;
+uint8_t buzzerPin=8;
+
+unsigned long lastCollisionTime = 0;
+unsigned long collisionDelay = 3000; // 3 saniye
+
+unsigned long buzzerStartTime= 0;
+const unsigned long buzzer_duration = 2000;
+int ledPins_can[]={P0,P1,P2};
+int ledPins_silah[]={P3,P4,P5};
+
+
+PCF8574 pcf1(addr1);
+PCF8574 pcf2(addr2);
+PCF8574 pcf3(addr3);
+
+const uint8_t aseg = 0;
+const uint8_t bseg = 1;
+const uint8_t cseg = 2;
+const uint8_t dseg = 3;
+const uint8_t eseg = 4;
+const uint8_t fseg = 5;
+const uint8_t gseg = 6;
+
+#define ST_FP 4
+
+struct _st_ot_struct
+{
+  uint8_t missle_mask;    
+  uint8_t hit_mask;     
+  uint8_t points;
+  uint8_t draw_fn;
+  uint8_t move_fn;
+  uint8_t destroy_fn;   
+  uint8_t is_hit_fn;        
+  uint8_t fire_fn;  
+  
+};
+typedef struct _st_ot_struct st_ot;
+
+struct _st_obj_struct
+{
+  uint8_t ot;      
+  int8_t tmp;     
+  int16_t x, y;
+  int8_t x0,y0,x1,y1;
+};
+typedef struct _st_obj_struct st_obj;
+
+#define ST_DRAW_NONE 0
+#define ST_DRAW_BBOX 1
+#define ST_DRAW_TRASH1 2
+#define ST_DRAW_PLAYER1 3
+#define ST_DRAW_TRASH2 4
+
+#define ST_DRAW_GADGET1 7
+#define ST_DRAW_GADGET2 8
+#define ST_DRAW_BIG_TRASH 10
+
+#define ST_MOVE_NONE 0
+#define ST_MOVE_X_SLOW 1
+#define ST_MOVE_PX_NORMAL 2
+#define ST_MOVE_PX_FAST 3
+#define ST_MOVE_PLAYER 4
+#define ST_MOVE_PY 5
+#define ST_MOVE_NY 6
+#define ST_MOVE_IMPLODE 7
+#define ST_MOVE_X_FAST 8
+
+#define ST_MOVE_WALL 9
+#define ST_MOVE_NXPY 10
+#define ST_MOVE_NXNY 11
+
+#define ST_IS_HIT_NONE 0
+#define ST_IS_HIT_BBOX 1
+#define ST_IS_HIT_WALL 2
+
+
+#define ST_DESTROY_NONE 0
+#define ST_DESTROY_DISAPPEAR 1
+#define ST_DESTROY_TO_DUST 2
+#define ST_DESTROY_GADGET 3
+#define ST_DESTROY_PLAYER 4
+#define ST_DESTROY_PLAYER_GADGETS 5
+#define ST_DESTROY_BIG_TRASH 6
+#define ST_UP_TRASH 7
+
+#define ST_FIRE_NONE 0
+#define ST_FIRE_PLAYER1 1
+
+
+#define ST_OT_WALL_SOLID 1
+#define ST_OT_BIG_TRASH 2
+#define ST_OT_MISSLE 3
+#define ST_OT_TRASH1 4
+#define ST_OT_PLAYER 5
+#define ST_OT_TRASH_IMPLODE 8
+#define ST_OT_TRASH2 9
+
+
+
+u8g2_t *st_u8g2;
+
+u8g2_uint_t u8g_height_minus_one;
+
+#define ST_AREA_HEIGHT (st_u8g2->height - 8)
+#define ST_AREA_WIDTH (st_u8g2->width)
+
+uint8_t st_rnd(void) U8X8_NOINLINE;
+static st_obj *st_GetObj(uint8_t objnr) U8X8_NOINLINE;
+uint8_t st_GetMissleMask(uint8_t objnr);
+uint8_t st_GetHitMask(uint8_t objnr);
+int8_t st_FindObj(uint8_t ot) U8X8_NOINLINE;
+void st_ClrObjs(void) U8X8_NOINLINE;
+int8_t st_NewObj(void) U8X8_NOINLINE;
+uint8_t st_CntObj(uint8_t ot);
+uint8_t st_CalcXY(st_obj *o) U8X8_NOINLINE;
+void st_SetXY(st_obj *o, uint8_t x, uint8_t y) U8X8_NOINLINE;
+
+void st_FireStep(uint8_t is_auto_fire, uint8_t is_fire) U8X8_NOINLINE;
+
+void st_InitTrash(uint8_t x, uint8_t y, int8_t dir);
+void st_NewGadget(uint8_t x, uint8_t y);
+void st_NewPlayerMissle(uint8_t x, uint8_t y) ;
+
+void st_SetupPlayer(uint8_t objnr, uint8_t ot);
+
+
+
+const st_ot st_object_types[] U8X8_PROGMEM =
+{
+ 
+    { 0, 0,  0, ST_DRAW_NONE, ST_MOVE_NONE, ST_DESTROY_DISAPPEAR, ST_IS_HIT_NONE, ST_FIRE_NONE },
+    /* 1: wall, player will be destroyed */
+    { 2, 1, 30, ST_DRAW_BBOX, ST_MOVE_WALL, ST_DESTROY_DISAPPEAR, ST_IS_HIT_WALL, ST_FIRE_NONE },
+    /* ST_OT_BIG_TRASH (2) */
+    { 2, 1,  0, ST_DRAW_BIG_TRASH, ST_MOVE_X_SLOW, ST_DESTROY_BIG_TRASH, ST_IS_HIT_BBOX, ST_FIRE_NONE },
+    /* 3: simple space ship (player) missle */
+    { 1, 0,  0, ST_DRAW_BBOX, ST_MOVE_PX_FAST, ST_DESTROY_DISAPPEAR, ST_IS_HIT_NONE, ST_FIRE_NONE },
+    /* ST_OT_TRASH1 (4): trash */
+    { 2, 1,  0, ST_DRAW_TRASH1, ST_MOVE_X_SLOW, ST_DESTROY_TO_DUST, ST_IS_HIT_BBOX, ST_FIRE_NONE },
+    /* ST_OT_PLAYER (5): player space ship */
+    { 0, 2,  0, ST_DRAW_PLAYER1, ST_MOVE_PLAYER, ST_DESTROY_PLAYER, ST_IS_HIT_BBOX, ST_FIRE_PLAYER1},
+    /* ST_OT_DUST_PY (6): Last part of trash  */
+    { 0, 0,  0, ST_DRAW_BBOX, ST_MOVE_PY, ST_DESTROY_NONE, ST_IS_HIT_NONE, ST_FIRE_NONE},
+    /* ST_OT_DUST_NY (7): Last part of trash  */
+    { 0, 0,  0, ST_DRAW_BBOX, ST_MOVE_NY, ST_DESTROY_NONE, ST_IS_HIT_NONE, ST_FIRE_NONE },
+    /* ST_OT_TRASH_IMPLODE (8): trash was hit */
+    { 0, 0,  5, ST_DRAW_TRASH1, ST_MOVE_IMPLODE, ST_DESTROY_NONE, ST_IS_HIT_NONE, ST_FIRE_NONE },
+    /* ST_OT_TRASH2 (9): trash */
+    { 2, 1,  0, ST_DRAW_TRASH2, ST_MOVE_X_SLOW, ST_DESTROY_GADGET, ST_IS_HIT_BBOX, ST_FIRE_NONE },  
+   
+};
+
+
+
+#define ST_OBJ_CNT 80
+
+st_obj st_objects[ST_OBJ_CNT];
+
+
+uint8_t st_player_pos;
+
+/* points */
+#define ST_POINTS_PER_LEVEL 25 //burayı değiştireceğiz 
+uint16_t st_player_points;
+uint16_t st_player_points_delayed;
+uint16_t st_highscore = 0;
+
+
+
+#define ST_STATE_PREPARE 0
+#define ST_STATE_IPREPARE 1
+#define ST_STATE_GAME 2
+#define ST_STATE_END 3
+#define ST_STATE_IEND 4
+
+uint8_t st_state = ST_STATE_PREPARE;
+
+uint8_t st_difficulty = 1;
+#define ST_DIFF_VIS_LEN 14
+#define ST_DIFF_FP 1
+#define ST_DIFF_VIS_LENA 2
+#define ST_DIFF_FPC 2
+#define ST_DIFF_VIS_LENAC 4
+uint8_t oyunmodu;
+uint16_t st_to_diff_cnt = 0;
+
+
+uint8_t st_tr_cnt = 0;
+uint16_t st_can_hak=3;
+uint16_t st_can_hak_delayed;
+uint16_t st_silah_hak=0;
+uint16_t st_silah_hak_delayed;
+
+
+const uint8_t st_bitmap_player1[]  = 
+{ 
+  /* 01100000 */ 0x060,
+  /* 11111000 */ 0x0f8,
+  /* 01111110 */ 0x07e,
+  /* 11111000 */ 0x0f8,
+  /* 01100000 */ 0x060
+};
+
+
+const uint8_t st_bitmap_trash_5x5_1[] = 
+{ 
+  /* 01110000 */ 0x070,
+  /* 11110000 */ 0x0f0,
+  /* 11111000 */ 0x0f8,
+  /* 01111000 */ 0x078,
+  /* 00110000 */ 0x030,
+};
+
+const uint8_t st_bitmap_trash_5x5_2[] = 
+{ 
+  /* 00110000 */ 0x030,
+  /* 11111000 */ 0x0f8,
+  /* 11111000 */ 0x0f8,
+  /* 11110000 */ 0x0f0,
+  /* 01110000 */ 0x070,
+};
+
+const uint8_t st_bitmap_gadget[] = 
+{ 
+   /* 00111000 */ 0x038,
+  /* 01111100 */ 0x07c,
+  /* 10111110 */ 0x0be,
+  /* 11111111 */ 0x0ff,
+  /* 11111111 */ 0x0ff,
+  /* 10111110 */ 0x0be,
+  /* 01111100 */ 0x07c,
+  /* 00111000 */ 0x038,
+};
+
+const uint8_t digitMap[] = {
+  B1111110,  // 0
+  B0110000,  // 1
+  B1101101,  // 2
+  B1111001,  // 3
+  B0110011,  // 4
+  B1011011,  // 5
+  B1011111,  // 6
+  B1110000,  // 7
+  B1111111,  // 8
+  B1111011   // 9
+};
+
+
+
+
+
+
+char st_itoa_buf[12];
+char *st_itoa(unsigned long v)
+{
+  volatile unsigned char i = 11;
+  st_itoa_buf[11] = '\0';
+  while( i > 0)
+  {
+      i--;
+      st_itoa_buf[i] = (v % 10)+'0';
+      v /= 10;
+      if ( v == 0 )
+  break;
+  }
+  return st_itoa_buf+i;
+}
+
+
+uint8_t st_rnd(void)
+{
+  return rand();
+}
+
+
+static st_obj *st_GetObj(uint8_t objnr)
+{
+  return st_objects+objnr;
+}
+
+
+
+uint8_t st_GetMissleMask(uint8_t objnr)
+{
+  st_obj *o = st_GetObj(objnr);
+  
+  return u8x8_pgm_read(&(st_object_types[o->ot].missle_mask));
+}
+
+
+uint8_t st_GetHitMask(uint8_t objnr)
+{
+  st_obj *o = st_GetObj(objnr);
+  return u8x8_pgm_read(&(st_object_types[o->ot].hit_mask));
+}
+
+int8_t st_FindObj(uint8_t ot)
+{
+  int8_t i;
+  for( i = 0; i < ST_OBJ_CNT; i++ )
+  {
+    if ( st_objects[i].ot == ot )
+      return i;
+  }
+  return -1;
+}
+
+
+void st_ClrObjs(void)
+{
+  int8_t i;
+  for( i = 0; i < ST_OBJ_CNT; i++ )
+    st_objects[i].ot = 0;
+}
+
+int8_t st_NewObj(void)
+{
+  int8_t i;
+  for( i = 0; i < ST_OBJ_CNT; i++ )
+  {
+    if ( st_objects[i].ot == 0 )
+      return i;
+  }
+  return -1;
+}
+
+
+uint8_t st_CntObj(uint8_t ot)
+{
+  uint8_t i;
+  uint8_t cnt = 0;
+  for( i = 0; i < ST_OBJ_CNT; i++ )
+  {
+    if ( st_objects[i].ot == ot )
+      cnt++;
+  }
+  return cnt;
+}
+
+
+uint8_t st_px_x, st_px_y; /* pixel within area */
+uint8_t st_CalcXY(st_obj *o)
+{
+  //st_obj *o = st_GetObj(objnr);
+  st_px_y = o->y>>ST_FP;
+  st_px_x = o->x>>ST_FP;
+  return st_px_x;
+}
+
+void st_SetXY(st_obj *o, uint8_t x, uint8_t y)
+{
+  o->x = ((int16_t)x) << ST_FP;
+  o->y = ((int16_t)y) << ST_FP;
+}
+
+int16_t st_bbox_x0, st_bbox_y0, st_bbox_x1, st_bbox_y1;  
+
+void st_CalcBBOX(uint8_t objnr)
+{
+  st_obj *o = st_GetObj(objnr);
+  
+  st_bbox_x0 = (uint16_t)(o->x>>ST_FP);
+  st_bbox_x1 = st_bbox_x0;
+  st_bbox_x0 += o->x0;
+  st_bbox_x1 += o->x1;
+
+  st_bbox_y0 = (uint16_t)(o->y>>ST_FP);
+  st_bbox_y1 = st_bbox_y0;
+  st_bbox_y0 += o->y0;
+  st_bbox_y1 += o->y1;
+}
+
+
+uint8_t st_cbbox_x0, st_cbbox_y0, st_cbbox_x1, st_cbbox_y1;
+uint8_t st_ClipBBOX(void)
+{
+  if ( st_bbox_x0 >= ST_AREA_WIDTH )
+    return 0;
+  if ( st_bbox_x0 >= 0 )
+    st_cbbox_x0  = (uint16_t)st_bbox_x0;
+  else
+    st_cbbox_x0 = 0;
+
+  if ( st_bbox_x1 < 0 )
+    return 0;
+  if ( st_bbox_x1 < ST_AREA_WIDTH )
+    st_cbbox_x1  = (uint16_t)st_bbox_x1;
+  else
+    st_cbbox_x1 = ST_AREA_WIDTH-1;
+
+  if ( st_bbox_y0 >= ST_AREA_HEIGHT )
+    return 0;
+  if ( st_bbox_y0 >= 0 )
+    st_cbbox_y0  = (uint16_t)st_bbox_y0;
+  else
+    st_cbbox_y0 = 0;
+
+  if ( st_bbox_y1 < 0 )
+    return 0;
+  if ( st_bbox_y1 < ST_AREA_HEIGHT )
+    st_cbbox_y1  = (uint16_t)st_bbox_y1;
+  else
+    st_cbbox_y1 = ST_AREA_HEIGHT-1;
+  
+  return 1;
+}
+
+
+  uint8_t st_IsOut(uint8_t objnr)
+{
+  st_CalcBBOX(objnr);
+  if ( st_bbox_x0 >= ST_AREA_WIDTH )
+    return 1;
+  if ( st_bbox_x1 < 0 )
+    return 1;
+  if ( st_bbox_y0 >= ST_AREA_HEIGHT )
+    return 1;
+  if ( st_bbox_y1 < 0 )
+    return 1;
+  return 0;
+}
+
+
+void st_Disappear(uint8_t objnr)
+{
+  st_obj *o = st_GetObj(objnr);
+  st_player_points += u8x8_pgm_read(&(st_object_types[o->ot].points));
+  o->ot = 0;
+}
+
+
+void st_Move(uint8_t objnr)
+{
+  st_obj *o = st_GetObj(objnr);
+  switch(u8x8_pgm_read(&(st_object_types[o->ot].move_fn)))
+  {
+    case ST_MOVE_NONE:
+      break;
+    case ST_MOVE_X_SLOW:
+      o->x -= (2<<ST_FP);
+      if(oyunmodu==2){
+       o->x -= st_difficulty;
+      }
+      break;
+    case ST_MOVE_PX_NORMAL:
+      o->x += (1<<ST_FP)/4;
+      break;
+    case ST_MOVE_PX_FAST:
+      o->x += (1<<ST_FP);
+      break;
+    case ST_MOVE_PLAYER:
+      o->y = st_player_pos<<ST_FP;
+      break;
+    case ST_MOVE_PY:
+      o->y += 3*ST_FP;
+      break;
+    case ST_MOVE_NY:
+      o->y -= 3*ST_FP;
+      break;
+    case ST_MOVE_IMPLODE:
+      st_Disappear(objnr);
+     
+      break;
+  }
+}
+
+void st_DrawBBOX(uint8_t objnr)
+{
+  uint8_t y0, y1;
+  st_CalcBBOX(objnr);
+  if ( st_ClipBBOX() == 0 )
+    return;
+
+
+  
+  
+
+
+  u8g2_SetDrawColor(st_u8g2, 1);
+  y0 = u8g_height_minus_one - st_cbbox_y0;
+  y1 = u8g_height_minus_one - st_cbbox_y1;
+  
+  u8g2_DrawFrame(st_u8g2, st_cbbox_x0, y1, st_cbbox_x1-st_cbbox_x0+1, y0-y1+1);
+  
+  //dog_SetBox(st_cbbox_x0, st_cbbox_y0, st_cbbox_x1, st_cbbox_y1);
+
+
+}
+
+#ifdef FN_IS_NOT_IN_USE
+void st_DrawFilledBox(uint8_t objnr)
+{
+  st_CalcBBOX(objnr);
+  if ( st_ClipBBOX() == 0 )
+    return;
+ 
+  dog_SetBox(st_cbbox_x0, st_cbbox_y0, st_cbbox_x1, st_cbbox_y1);
+}
+#endif
+
+void st_DrawBitmap(uint8_t objnr, const uint8_t * bm, uint8_t w, uint8_t h)
+{
+
+  st_CalcBBOX(objnr);
+  
+  u8g2_DrawBitmap(st_u8g2, st_bbox_x0, u8g_height_minus_one - st_bbox_y1, (w+7)/8, h, bm);
+  
+ }
+
+void st_DrawObj(uint8_t objnr)
+{
+  st_obj *o = st_GetObj(objnr);
+  switch(u8x8_pgm_read(&(st_object_types[o->ot].draw_fn)))
+  {
+    case ST_DRAW_NONE:
+      break;
+    case ST_DRAW_BBOX:
+      st_DrawBBOX(objnr);
+      break;
+    case ST_DRAW_TRASH1:
+      st_DrawBitmap(objnr, st_bitmap_trash_5x5_1,o->x1-o->x0+1, 5);
+      break;
+    case ST_DRAW_TRASH2:
+      st_DrawBitmap(objnr, st_bitmap_gadget,o->x1-o->x0+1, 5);
+      break;
+    
+    case ST_DRAW_PLAYER1:
+      st_DrawBitmap(objnr, st_bitmap_player1,7,5);
+      break;
+    case ST_DRAW_GADGET1:
+      
+       st_DrawBitmap(objnr, st_bitmap_gadget,o->x1-o->x0+1, 5); 
+
+      break;
+     
+   
+  }
+}
+
+uint8_t st_IsHitBBOX(uint8_t objnr, uint8_t x, uint8_t y)
+{
+  st_CalcBBOX(objnr);
+  if ( st_ClipBBOX() == 0 ) 
+    return 0; 
+  if ( x < st_cbbox_x0 )
+    return 0;
+  if ( x > st_cbbox_x1 )
+    return 0;
+  if ( y < st_cbbox_y0 )
+    return 0;
+  if ( y > st_cbbox_y1 )
+    return 0;
+  return 1;
+}
+
+void st_Destroy(uint8_t objnr)
+{
+  int8_t nr;
+  st_obj *o = st_GetObj(objnr);
+  switch(u8x8_pgm_read(&(st_object_types[o->ot].destroy_fn)))
+  {
+    case ST_DESTROY_NONE:      
+      break;
+    case ST_DESTROY_DISAPPEAR:  
+      st_Disappear(objnr);
+      break;
+    case ST_DESTROY_GADGET: 
+   o->ot=ST_OT_TRASH1;
+   
+
+      
+      break;
+      
+    case ST_DESTROY_TO_DUST:
+      o->ot = ST_OT_TRASH_IMPLODE;
+      o->tmp = 0;
+      break;
+    case ST_DESTROY_BIG_TRASH:
+      st_Disappear(objnr);
+      break;
+    case ST_DESTROY_PLAYER:
+
+   if (lastCollisionTime == 0 || millis() - lastCollisionTime > collisionDelay) {
+  
+    st_can_hak--;
+   lastCollisionTime = millis();
+    digitalWrite(buzzerPin, HIGH);
+     buzzerStartTime = millis();
+   }
+        
+      if(st_can_hak==0){
+      st_Disappear(objnr);
+      st_state = ST_STATE_END;
+      o->tmp = 0;
+      break;
+     }
+      break;
+    
+  }
+}
+
+
+uint8_t st_IsHit(uint8_t objnr, uint8_t x, uint8_t y, uint8_t missle_mask)
+{
+  uint8_t hit_mask = st_GetHitMask(objnr);
+  st_obj *o;
+  
+  if ( (hit_mask & missle_mask) == 0 )
+    return 0;
+  
+  o = st_GetObj(objnr);
+  
+  switch(u8x8_pgm_read(&(st_object_types[o->ot].is_hit_fn)))
+  {
+    case ST_IS_HIT_NONE:
+      break;
+    case ST_IS_HIT_BBOX:
+      if ( st_IsHitBBOX(objnr, x, y) != 0 )
+      {
+  st_Destroy(objnr);
+  return 1;
+      }
+      break;
+  }
+  return 0;
+}
+
+
+
+
+uint8_t st_fire_player = 0;
+uint8_t st_fire_period = 3;
+uint8_t st_manual_fire_delay = 20;
+uint8_t st_is_fire_last_value = 0;
+
+
+void st_FireStep(uint8_t is_auto_fire, uint8_t is_fire)
+{
+ 
+ 
+ if ( is_auto_fire != 0 )
+  {
+    st_fire_player++;
+    if ( st_fire_player >= st_fire_period )
+      st_fire_player = 0;
+  }
+  else
+  {
+    if ( st_fire_player < st_manual_fire_delay )
+    {
+      st_fire_player++;
+    }
+    else
+    {
+      if ( st_is_fire_last_value == 0 )
+  if ( is_fire != 0 )
+  //   st_silah_hak--;
+    st_fire_player = 0;
+    }
+    st_is_fire_last_value = is_fire;
+  }
+
+   
+    
+}
+
+
+void st_Fire(uint8_t objnr)
+{
+  st_obj *o = st_GetObj(objnr);
+  uint8_t x;
+  uint8_t y;
+  uint8_t cnt;
+    
+  switch(u8x8_pgm_read(&(st_object_types[o->ot].fire_fn)))
+  {
+    case ST_FIRE_NONE: 
+      break;
+    case ST_FIRE_PLAYER1: 
+      if ( st_fire_player == 0 )
+      {
+  /* create missle at st_px_x and st_px_y */
+  x = st_CalcXY(o);
+  y = st_px_y;
+  
+  st_NewPlayerMissle(x, y);
+      }
+      break;
+    
+    
+  }
+}
+
+
+
+void st_InitTrash(uint8_t x, uint8_t y, int8_t dir)
+{
+  st_obj *o;
+  int8_t objnr = st_NewObj();
+  if ( objnr < 0 )
+    return;
+  o = st_GetObj(objnr);
+  if ( (st_rnd() & 1) == 0 )
+    o->ot = ST_OT_TRASH1;
+  else
+    o->ot = ST_OT_TRASH2;
+  if ( dir == 0 )
+  {
+    o->tmp = 0;
+    if ( st_rnd() & 1 )
+    {
+      if ( st_rnd() & 1 )
+  o->tmp++;
+      else
+  o->tmp--;
+    }
+  }
+  else
+  {
+    o->tmp = dir;
+  }
+  st_SetXY(o, x, y);
+  //o->x = (x)<<ST_FP;
+  //o->y = (y)<<ST_FP;
+  o->x0 = -3;
+  o->x1 = 1;
+  o->y0 = -2;
+  o->y1 = 2;
+
+}
+
+
+
+
+void st_NewPlayerMissle(uint8_t x, uint8_t y)
+{
+  st_obj *o;
+  int8_t objnr = st_NewObj();
+  if ( objnr < 0 )
+    return;
+  o = st_GetObj(objnr);
+  o->ot = ST_OT_MISSLE;
+  st_SetXY(o, x, y);
+  //o->x = x<<ST_FP;
+  //o->y = y<<ST_FP;
+  o->x0 = -4;
+  o->x1 = 1;
+  o->y0 = 0;
+  o->y1 = 0;
+}
+
+void st_SetupPlayer(uint8_t objnr, uint8_t ot)
+{
+  st_obj *o = st_GetObj(objnr);
+  switch(ot)
+  {
+    case ST_OT_PLAYER:
+      o->ot = ot;
+      o->y0 = -2;
+      o->y1 = 2;
+      break;
+
+  }
+}
+
+
+
+
+void st_NewPlayer(void)
+{
+  st_obj *o;
+  int8_t objnr = st_NewObj();
+  if ( objnr < 0 )
+    return;
+  o = st_GetObj(objnr);
+  o->x = 6<<ST_FP;
+  o->y = (ST_AREA_HEIGHT/2)<<ST_FP;
+  o->x0 = -6;
+  o->x1 = 0;
+  st_SetupPlayer(objnr, ST_OT_PLAYER);
+}
+
+
+
+void st_InitDeltaTrash(void)
+{
+  uint8_t i;
+  uint8_t cnt;
+  uint8_t max_x = 0;
+  uint8_t max_l;
+  
+  uint8_t upper_trash_limit = ST_OBJ_CNT-7;
+  uint8_t min_dist_for_new = 3;
+
+  
+  for( i = 0; i < ST_OBJ_CNT; i++ )
+  {
+    if ( st_objects[i].ot == ST_OT_TRASH1 || st_objects[i].ot == ST_OT_TRASH2   || st_objects[i].ot == ST_OT_BIG_TRASH )
+    {
+      cnt++;
+      if ( max_x < (st_objects[i].x>>ST_FP) )
+  max_x = (st_objects[i].x>>ST_FP);
+    }
+  }
+  max_l = ST_AREA_WIDTH;
+  max_l -= min_dist_for_new;
+  
+  if ( cnt < upper_trash_limit )
+   if ( max_x < max_l ) 
+    {
+
+  st_InitTrash(ST_AREA_WIDTH-1, rand() & (ST_AREA_HEIGHT-1),0);
+      st_tr_cnt++;
+
+    }
+
+}
+
+void st_InitDelta(void)
+{
+  st_InitDeltaTrash();
+  
+}
+
+void st_DrawInGame(uint8_t fps)
+{
+  uint8_t i;
+  /* draw all objects */
+  for( i = 0; i < ST_OBJ_CNT; i++ )
+      st_DrawObj(i);
+  u8g2_SetDrawColor(st_u8g2, 0);
+  u8g2_DrawBox(st_u8g2, 0, u8g_height_minus_one - ST_AREA_HEIGHT-3, st_u8g2->width, 4);
+  
+  u8g2_SetDrawColor(st_u8g2, 1);
+  
+  
+
+}
+
+
+void st_Draw(uint8_t fps,uint8_t pin_sec,uint8_t is_start )
+{
+  switch(st_state)
+  { 
+    case ST_STATE_PREPARE:
+    case ST_STATE_IPREPARE:
+      
+      u8g2_SetFont(st_u8g2, u8g_font_6x10r);
+      u8g2_SetFontDirection(st_u8g2, 1);
+      u8g2_SetDrawColor(st_u8g2, 1);
+   
+      u8g2_DrawStr(st_u8g2, 110, u8g_height_minus_one - (st_u8g2->height-6)+5 , "Uzay Oyun");
+      u8g2_DrawStr(st_u8g2, 85, u8g_height_minus_one - (st_u8g2->height-6) +5 , "Basit");
+      u8g2_DrawStr(st_u8g2, 60, u8g_height_minus_one - (st_u8g2->height-6)+5, "Zor");
+      u8g2_DrawStr(st_u8g2, 15,u8g_height_minus_one - (st_u8g2->height-6)+5, "START");
+      
+      if(pin_sec==1){
+    oyunmodu=1;
+       u8g2_DrawVLine(st_u8g2, 90, u8g_height_minus_one - (st_u8g2->height-6)/2, 15);
+      }
+      
+    if(pin_sec==0){
+    oyunmodu=2;
+     u8g2_DrawVLine(st_u8g2, 63, u8g_height_minus_one - (st_u8g2->height-6)/2, 15);   
+  } 
+
+if (is_start ) {
+        st_SetupInGame();
+     st_state = ST_STATE_GAME;
+        break;
+     }
+      
+    
+    case ST_STATE_GAME:
+
+      st_DrawInGame(fps);
+      break;
+    case ST_STATE_END:
+    
+    break;
+    case ST_STATE_IEND:
+      u8g2_SetFont(st_u8g2, u8g_font_4x6r);
+      u8g2_SetDrawColor(st_u8g2, 1);
+     
+      break;
+      
+  }
+}
+
+void st_SetupInGame(void)
+{ 
+  
+  st_player_points = 0;
+  st_player_points_delayed = 0;
+  st_difficulty = 1;
+  st_to_diff_cnt = 0;
+  st_can_hak=3;
+  st_silah_hak=0;
+  st_ClrObjs();
+  st_NewPlayer();
+  
+}
+
+
+
+void st_Setup(u8g2_t *u8g)
+{ 
+  
+  st_u8g2 = u8g;
+  u8g2_SetBitmapMode(u8g, 1);
+  u8g_height_minus_one = u8g->height;
+  u8g_height_minus_one--;
+  
+}
+
+void st_StepInGame(uint8_t player_pos, uint8_t is_auto_fire, uint8_t is_fire)
+{
+  uint8_t i, j;
+  uint8_t missle_mask;
+  uint8_t nr;
+  
+  
+  if ( player_pos < 64 )
+    st_player_pos = 0;
+  else if ( player_pos >= 192 )
+    st_player_pos = ST_AREA_HEIGHT-2-1;
+  else 
+    st_player_pos = ((uint16_t)((player_pos-64)) * (uint16_t)(ST_AREA_HEIGHT-2))/128;
+  st_player_pos+=8;
+  /* move all objects */
+  for( i = 0; i < ST_OBJ_CNT; i++ )
+    st_Move(i);
+
+  /* check for objects which left the play area */
+  for( i = 0; i < ST_OBJ_CNT; i++ )
+    if ( st_objects[i].ot != 0 )
+      if ( st_IsOut(i) != 0 )
+  st_Disappear(i);
+      
+  /* missle and destruction handling */
+  for( i = 0; i < ST_OBJ_CNT; i++ )
+  {
+    missle_mask = st_GetMissleMask(i);
+    if ( missle_mask != 0 )
+                               
+      if ( st_CalcXY(st_objects+i) != 0 ){
+                                    
+  for( j = 0; j < ST_OBJ_CNT; j++ ){  
+                                   
+    if ( i != j )                     
+      if ( st_IsHit(j, st_px_x, st_px_y, missle_mask) != 0 )    
+      {                            
+        st_Destroy(i);
+      }
+  }
+      }
+  }
+
+    st_FireStep(is_auto_fire, is_fire);
+ 
+
+
+  st_InitDelta();
+
+  if ( st_tr_cnt == 25 )
+  {
+     st_tr_cnt=0;
+     st_can_hak++;
+      if (st_can_hak>3){
+      st_can_hak=3;
+    }
+    st_silah_hak++;
+    if (st_silah_hak>3){
+      st_silah_hak=3;
+    }
+  }
+  
+  if(st_silah_hak>0){
+    for( i = 0; i < ST_OBJ_CNT; i++ )
+    st_Fire(i);
+  if(is_fire !=0)
+  st_silah_hak--;
+  }
+
+  
+    
+  if(oyunmodu==2){
+  st_to_diff_cnt++;
+  if ( st_to_diff_cnt == (ST_DIFF_VIS_LEN<<ST_DIFF_FP) )
+  {  
+    st_to_diff_cnt = 0;
+    st_difficulty++;
+  }  
+  }
+  /* update visible player points */
+  if ( st_player_points_delayed < st_player_points )
+    st_player_points_delayed++;
+}
+
+
+void st_Step(uint8_t player_pos, uint8_t is_auto_fire, uint8_t is_fire)
+{
+  switch(st_state)
+  {
+    
+    case ST_STATE_PREPARE:
+    
+      
+      break;
+    case ST_STATE_IPREPARE:
+    
+     
+   
+     
+    case ST_STATE_GAME:
+    st_StepInGame(player_pos, is_auto_fire, is_fire);
+    break;
+    
+  case ST_STATE_END:
+  int j=0;
+   for( j = 0; j < ST_OBJ_CNT; j++ ){  
+                                   
+                                                
+        st_Destroy(j);
+      
+  }
+  
+  st_state = ST_STATE_IEND;
+  st_to_diff_cnt=0;
+  break;
+  
+  case ST_STATE_IEND:
+  if ( st_to_diff_cnt == 0 )
+  st_state = ST_STATE_IPREPARE;
+  break;
+  }
+  
+}
+
+
+void showDigit(int digit, PCF8574& pcf) {
+  uint8_t value = digitMap[digit];
+
+  // Pinler ilgili değere göre ayarlanır
+  pcf.digitalWrite(aseg, (value >> 6) & 0x01);
+  pcf.digitalWrite(bseg, (value >> 5) & 0x01);
+  pcf.digitalWrite(cseg, (value >> 4) & 0x01);
+  pcf.digitalWrite(dseg, (value >> 3) & 0x01);
+  pcf.digitalWrite(eseg, (value >> 2) & 0x01);
+  pcf.digitalWrite(fseg, (value >> 1) & 0x01);
+  pcf.digitalWrite(gseg, value & 0x01);
+}
+
+  void setup(void) {
+  u8g2.begin();
+  pinMode(buzzerPin, OUTPUT);
+ 
+   for (int i = 0; i < 3; i++) {
+   pcf8574_1.pinMode(ledPins_can[i], OUTPUT);
+  }
+   for (int i = 0; i < 3; i++) {
+   pcf8574_1.pinMode(ledPins_silah[i], OUTPUT);
+  }
+
+  pcf1.begin();
+  pcf2.begin();
+  pcf3.begin();
+
+   
+  for (int i = 0; i < 7; i++) {
+    pcf1.pinMode(i, OUTPUT);
+    pcf2.pinMode(i, OUTPUT);
+    pcf3.pinMode(i, OUTPUT);
+  }
+
+  
+}
+uint8_t sec_cnt=1;
+
+float y = 128;
+
+  void loop(void) {
+ u8g2.setFont(u8g2_font_6x10_tr);
+  u8g2.setFontDirection(0);
+  u8g2.setFontRefHeightAll(); 
+
+
+
+  st_Setup(u8g2.getU8g2());
+  for(;;)
+  {   
+   st_Step(y, /* is_auto_fire */ 0, /* is_fire */ digitalRead(pin_fire));
+    u8g2.firstPage();
+    
+     if(digitalRead(pin_sec)){
+     sec_cnt++;
+     sec_cnt=sec_cnt%2;
+     break;
+  }
+  
+    do
+    {
+      st_Draw(0,sec_cnt,digitalRead(pin_start));
+      
+    } while( u8g2.nextPage());
+
+      // Sayı basamaklarına ayrılıyor
+  int ones = st_to_diff_cnt % 10;
+  
+  int tens = (st_to_diff_cnt/10)% 10;
+  int hundreds = st_to_diff_cnt/100;
+// Basamaklar 7 segment display'de gösteriliyor
+
+showDigit(hundreds, pcf1);
+  showDigit(tens, pcf2);
+  showDigit(ones, pcf3);
+ 
+ if (millis() - buzzerStartTime >= 500) { // 2 saniye geçtiyse
+  digitalWrite(buzzerPin, LOW); // buzzer'ı kapat
+}
+
+ 
+
+
+ if(st_can_hak==3){
+    pcf8574_1.digitalWrite(ledPins_can[0], HIGH); //LED'i yak 
+    pcf8574_1.digitalWrite(ledPins_can[1], HIGH); //LED'i söndür
+     pcf8574_1.digitalWrite(ledPins_can[2], HIGH); 
+  }
+   if(st_can_hak==2){
+    pcf8574_1.digitalWrite(ledPins_can[0], HIGH); //LED'i yak 
+    pcf8574_1.digitalWrite(ledPins_can[1], HIGH); //LED'i söndür
+     pcf8574_1.digitalWrite(ledPins_can[2], LOW); 
+  }
+   if(st_can_hak==1){
+    pcf8574_1.digitalWrite(ledPins_can[0], HIGH); //LED'i yak 
+    pcf8574_1.digitalWrite(ledPins_can[1], LOW); //LED'i söndür
+     pcf8574_1.digitalWrite(ledPins_can[2], LOW); 
+  }
+     if(st_can_hak==0){
+    pcf8574_1.digitalWrite(ledPins_can[0], LOW); //LED'i yak 
+    pcf8574_1.digitalWrite(ledPins_can[1], LOW); //LED'i söndür
+    pcf8574_1.digitalWrite(ledPins_can[2], LOW); 
+  }
+  
+ if(st_silah_hak==3){
+  
+    pcf8574_1.digitalWrite(ledPins_silah[0], HIGH); //LED'i yak 
+    pcf8574_1.digitalWrite(ledPins_silah[1], HIGH); //LED'i söndür
+    pcf8574_1.digitalWrite(ledPins_silah[2], HIGH); 
+  }
+  if(st_silah_hak==2){
+    pcf8574_1.digitalWrite(ledPins_silah[0], HIGH); //LED'i yak 
+    pcf8574_1.digitalWrite(ledPins_silah[1], HIGH); //LED'i söndür
+    pcf8574_1.digitalWrite(ledPins_silah[2], LOW); 
+  }
+   if(st_silah_hak==1){
+    pcf8574_1.digitalWrite(ledPins_silah[0], HIGH); //LED'i yak 
+    pcf8574_1.digitalWrite(ledPins_silah[1], LOW); //LED'i söndür
+    pcf8574_1.digitalWrite(ledPins_silah[2], LOW); 
+  }
+     if(st_silah_hak==0){
+    pcf8574_1.digitalWrite(ledPins_silah[0], LOW); //LED'i yak 
+    pcf8574_1.digitalWrite(ledPins_silah[1], LOW); //LED'i söndür
+    pcf8574_1.digitalWrite(ledPins_silah[2], LOW); 
+  }
+
+      y = analogRead(pot_pin);
+             
+     y = floor((y - 64) * 0.180);
+   
+  
+  
+    
+  }  
+  
+}
